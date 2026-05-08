@@ -92,7 +92,7 @@ jobs:
         run: |
           mkdir -p dist
           binary="deployctl-${{ github.event.inputs.version }}-${GOOS}-${GOARCH}${{ matrix.ext }}"
-          go build -trimpath -ldflags="-s -w" -o "dist/${binary}" ./cmd/deployctl
+          go build -trimpath -ldflags="-s -w" -o "dist/${binary}" ./cmd/deployctl-rsync
 
       - name: Package artifact
         run: |
