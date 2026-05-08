@@ -21,6 +21,12 @@ deploy:
   # 1. src_dir + remote_dir + command: copy first, then execute command
   # 2. src_dir + remote_dir: copy only
   # 3. command: execute only
+  #
+  # copy_method:
+  #   sftp  - pure Go SFTP copy, no rsync dependency, supports password and key auth
+  #   rsync - use external rsync, requires local rsync, remote rsync, and usable SSH key/agent
+  #   auto  - prefer rsync when usable, otherwise fall back to SFTP
+  copy_method: sftp
   src_dir: ""
   remote_dir: ""
   command: ""
