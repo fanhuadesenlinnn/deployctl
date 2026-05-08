@@ -27,10 +27,16 @@ const markerPrefix = "deployctl-managed"
 type Config struct {
 	Concurrency int           `yaml:"concurrency"`
 	Timeout     time.Duration `yaml:"timeout"`
+	Logging     LoggingConfig `yaml:"logging"`
 	Defaults    Auth          `yaml:"defaults"`
 	Trust       Trust         `yaml:"trust"`
 	Deploy      Deploy        `yaml:"deploy"`
 	Hosts       []Node        `yaml:"hosts"`
+}
+
+type LoggingConfig struct {
+	File  string `yaml:"file"`
+	Level string `yaml:"level"`
 }
 
 type Auth struct {
@@ -50,28 +56,53 @@ type Node struct {
 	Key         string `yaml:"key"`
 }
 
-type Trust struct{ ManagedKey string `yaml:"managed_key"` }
+type Trust struct {
+	ManagedKey string `yaml:"managed_key"`
+}
+
 type Deploy struct {
 	SrcDir    string `yaml:"src_dir"`
 	RemoteDir string `yaml:"remote_dir"`
 	Command   string `yaml:"command"`
 	Mode      string `yaml:"mode"`
 }
+
 type Host struct {
-	Name, User, Password, Key string
-	Port                      int
+	Name           string
+	User           string
+	Port           int
+	Password       string
+	PasswordSource string
+	Key            string
+	KeySource      string
 }
+
 type Result struct {
 	Host     string
 	ExitCode int
 	Err      error
 }
 
+type Options struct {
+	ConfigPath string
+	LogFile    string
+	Verbosity  int
+}
+
+type Logger struct {
+	mu        sync.Mutex
+	file      *os.File
+	verbosity int
+}
+
+var logger = &Logger{}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
 	}
+
 	var err error
 	switch os.Args[1] {
 	case "init":
@@ -92,25 +123,31 @@ func main() {
 	default:
 		err = fmt.Errorf("unknown command: %s", os.Args[1])
 	}
+
 	if err != nil {
 		logErr("%v", err)
 		os.Exit(1)
 	}
 }
+
 func usage() {
-	fmt.Println(`deployctl - batch SSH/SFTP deployment tool
+	fmt.Print(`deployctl - batch SSH/SFTP deployment tool
 
 Usage:
   deployctl init -o config.yaml [-force]
-  deployctl trust-add -c config.yaml
-  deployctl trust-remove -c config.yaml
-  deployctl copy -c config.yaml --src AnyBackupClient --remote-dir /opt
-  deployctl exec -c config.yaml --cmd "hostname && uptime" --mode hidden|visible
-  deployctl deploy -c config.yaml --mode hidden|visible
+  deployctl trust-add -c config.yaml [-v|-vv|-vvv] [--log-file deployctl.log]
+  deployctl trust-remove -c config.yaml [-v|-vv|-vvv] [--log-file deployctl.log]
+  deployctl copy -c config.yaml --src local-package --remote-dir /opt [-v|-vv|-vvv]
+  deployctl exec -c config.yaml --cmd "hostname && uptime" --mode hidden|visible [-v|-vv|-vvv]
+  deployctl deploy -c config.yaml --mode hidden|visible [-v|-vv|-vvv]
 
 Modes:
   hidden   concurrent execution, collect output, show summary and exit code
   visible  sequential execution, stream remote output directly, Ctrl+C can stop
+
+Logging:
+  Screen shows normal logs by default. Use -v, -vv, or -vvv for more detail.
+  Logs are also written to logging.file in config or --log-file.
 `)
 }
 
@@ -118,9 +155,14 @@ func runInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	out := fs.String("o", "config.yaml", "output config file")
 	force := fs.Bool("force", false, "overwrite existing file")
+	opts := bindCommonFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	applyFlagOptions(fs, opts)
+	logger.open(first(opts.LogFile, "deployctl.log"), opts.Verbosity)
+	defer logger.close()
+
 	if _, err := os.Stat(*out); err == nil && !*force {
 		return fmt.Errorf("%s exists, use -force to overwrite", *out)
 	}
@@ -128,13 +170,17 @@ func runInit(args []string) error {
 		return err
 	}
 	logInfo("created default config: %s", *out)
+	logInfo("edit hosts, defaults, deploy, and logging sections before running other commands")
 	return nil
 }
+
 func runTrustAdd(args []string) error {
 	cfg, err := loadCfg("trust-add", args)
 	if err != nil {
 		return err
 	}
+	defer logger.close()
+
 	key := expand(def(cfg.Trust.ManagedKey, "~/.ssh/deployctl_id_rsa"))
 	if err := ensureKey(key); err != nil {
 		return err
@@ -143,29 +189,35 @@ func runTrustAdd(args []string) error {
 	if err != nil {
 		return err
 	}
-	hs, err := hosts(cfg)
+	hs, err := buildHosts(cfg)
 	if err != nil {
 		return err
 	}
+	logHostAuthPlan(hs)
 	return summary(batch(hs, cfg.Concurrency, func(h Host) Result { return result(h.Name, trustAdd(cfg, h, line, mark)) }))
 }
+
 func runTrustRemove(args []string) error {
 	cfg, err := loadCfg("trust-remove", args)
 	if err != nil {
 		return err
 	}
+	defer logger.close()
+
 	key := expand(def(cfg.Trust.ManagedKey, "~/.ssh/deployctl_id_rsa"))
 	line, mark, err := pubLine(key)
 	if err != nil {
 		return err
 	}
 	pre := keyPrefix(line)
-	hs, err := hosts(cfg)
+	hs, err := buildHosts(cfg)
 	if err != nil {
 		return err
 	}
+	logHostAuthPlan(hs)
 	return summary(batch(hs, cfg.Concurrency, func(h Host) Result { return result(h.Name, trustRemove(cfg, h, pre, mark)) }))
 }
+
 func runCopy(args []string) error {
 	var src, remote string
 	cfg, err := loadCfg("copy", args, func(fs *flag.FlagSet) {
@@ -175,16 +227,20 @@ func runCopy(args []string) error {
 	if err != nil {
 		return err
 	}
-	over(&cfg, src, remote, "", "")
+	defer logger.close()
+
+	overrideDeploy(&cfg, src, remote, "", "")
 	if err := localOK(cfg.Deploy.SrcDir); err != nil {
 		return err
 	}
-	hs, err := hosts(cfg)
+	hs, err := buildHosts(cfg)
 	if err != nil {
 		return err
 	}
+	logHostAuthPlan(hs)
 	return summary(batch(hs, cfg.Concurrency, func(h Host) Result { return result(h.Name, copyOne(cfg, h)) }))
 }
+
 func runExec(args []string) error {
 	var cmd, mode string
 	cfg, err := loadCfg("exec", args, func(fs *flag.FlagSet) {
@@ -194,16 +250,20 @@ func runExec(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer logger.close()
+
 	if strings.TrimSpace(cmd) == "" {
 		return errors.New("missing --cmd")
 	}
-	over(&cfg, "", "", cmd, mode)
-	hs, err := hosts(cfg)
+	overrideDeploy(&cfg, "", "", cmd, mode)
+	hs, err := buildHosts(cfg)
 	if err != nil {
 		return err
 	}
+	logHostAuthPlan(hs)
 	return runByMode(cfg, hs, func(h Host) Result { return execHidden(cfg, h, cmd) }, func(h Host) Result { return execVisible(cfg, h, cmd) })
 }
+
 func runDeploy(args []string) error {
 	var src, remote, cmd, mode string
 	cfg, err := loadCfg("deploy", args, func(fs *flag.FlagSet) {
@@ -215,60 +275,92 @@ func runDeploy(args []string) error {
 	if err != nil {
 		return err
 	}
-	over(&cfg, src, remote, cmd, mode)
+	defer logger.close()
+
+	overrideDeploy(&cfg, src, remote, cmd, mode)
 	if err := localOK(cfg.Deploy.SrcDir); err != nil {
 		return err
 	}
-	hs, err := hosts(cfg)
+	hs, err := buildHosts(cfg)
 	if err != nil {
 		return err
 	}
-	return runByMode(cfg, hs, func(h Host) Result {
-		if e := copyOne(cfg, h); e != nil {
-			return result(h.Name, e)
-		}
-		return execHidden(cfg, h, cfg.Deploy.Command)
-	}, func(h Host) Result {
-		if e := copyOne(cfg, h); e != nil {
-			return result(h.Name, e)
-		}
-		return execVisible(cfg, h, cfg.Deploy.Command)
-	})
+	logHostAuthPlan(hs)
+	return runByMode(cfg, hs,
+		func(h Host) Result {
+			if e := copyOne(cfg, h); e != nil {
+				return result(h.Name, e)
+			}
+			return execHidden(cfg, h, cfg.Deploy.Command)
+		},
+		func(h Host) Result {
+			if e := copyOne(cfg, h); e != nil {
+				return result(h.Name, e)
+			}
+			return execVisible(cfg, h, cfg.Deploy.Command)
+		},
+	)
 }
 
 func runByMode(cfg Config, hs []Host, hidden, visible func(Host) Result) error {
-	m := strings.ToLower(strings.TrimSpace(cfg.Deploy.Mode))
-	if m == "" {
-		m = "hidden"
+	mode := strings.ToLower(strings.TrimSpace(cfg.Deploy.Mode))
+	if mode == "" {
+		mode = "hidden"
 	}
-	switch m {
+	switch mode {
 	case "hidden":
+		logInfo("run mode: hidden, concurrency=%d", cfg.Concurrency)
 		return summary(batch(hs, cfg.Concurrency, hidden))
 	case "visible":
+		logInfo("run mode: visible, sequential execution")
 		rs := make([]Result, 0, len(hs))
 		for _, h := range hs {
 			rs = append(rs, visible(h))
 		}
 		return summary(rs)
 	default:
-		return fmt.Errorf("invalid mode %q", m)
+		return fmt.Errorf("invalid mode %q, expected hidden or visible", mode)
 	}
 }
 
 type hook func(*flag.FlagSet)
 
+func bindCommonFlags(fs *flag.FlagSet) *Options {
+	opts := &Options{}
+	fs.StringVar(&opts.ConfigPath, "c", "config.yaml", "config path")
+	fs.StringVar(&opts.ConfigPath, "config", "config.yaml", "config path")
+	fs.StringVar(&opts.LogFile, "log-file", "", "log file path")
+	fs.BoolFunc("v", "verbose logs", func(string) error { opts.Verbosity = max(opts.Verbosity, 1); return nil })
+	fs.BoolFunc("vv", "more verbose logs", func(string) error { opts.Verbosity = max(opts.Verbosity, 2); return nil })
+	fs.BoolFunc("vvv", "debug-level verbose logs", func(string) error { opts.Verbosity = max(opts.Verbosity, 3); return nil })
+	return opts
+}
+
+func applyFlagOptions(fs *flag.FlagSet, opts *Options) {
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "v":
+			opts.Verbosity = max(opts.Verbosity, 1)
+		case "vv":
+			opts.Verbosity = max(opts.Verbosity, 2)
+		case "vvv":
+			opts.Verbosity = max(opts.Verbosity, 3)
+		}
+	})
+}
+
 func loadCfg(name string, args []string, hooks ...hook) (Config, error) {
-	var p string
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
-	fs.StringVar(&p, "c", "config.yaml", "config path")
-	fs.StringVar(&p, "config", "config.yaml", "config path")
+	opts := bindCommonFlags(fs)
 	for _, h := range hooks {
 		h(fs)
 	}
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
-	b, err := os.ReadFile(p)
+	applyFlagOptions(fs, opts)
+
+	b, err := os.ReadFile(opts.ConfigPath)
 	if err != nil {
 		return Config{}, fmt.Errorf("read config failed: %w", err)
 	}
@@ -277,14 +369,26 @@ func loadCfg(name string, args []string, hooks ...hook) (Config, error) {
 		return Config{}, fmt.Errorf("parse yaml failed: %w", err)
 	}
 	defaults(&cfg)
+
+	logFile := first(opts.LogFile, cfg.Logging.File, "deployctl.log")
+	verbosity := max(opts.Verbosity, levelToVerbosity(cfg.Logging.Level))
+	logger.open(logFile, verbosity)
+	logDebug("config=%s log_file=%s verbosity=%d", opts.ConfigPath, logFile, verbosity)
 	return cfg, nil
 }
+
 func defaults(c *Config) {
 	if c.Concurrency <= 0 {
 		c.Concurrency = 5
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = 30 * time.Second
+	}
+	if c.Logging.File == "" {
+		c.Logging.File = "deployctl.log"
+	}
+	if c.Logging.Level == "" {
+		c.Logging.Level = "info"
 	}
 	if c.Defaults.User == "" {
 		c.Defaults.User = "root"
@@ -299,19 +403,20 @@ func defaults(c *Config) {
 		c.Trust.ManagedKey = "~/.ssh/deployctl_id_rsa"
 	}
 	if c.Deploy.SrcDir == "" {
-		c.Deploy.SrcDir = "AnyBackupClient"
+		c.Deploy.SrcDir = "local-package"
 	}
 	if c.Deploy.RemoteDir == "" {
 		c.Deploy.RemoteDir = "/opt"
 	}
 	if c.Deploy.Command == "" {
-		c.Deploy.Command = fmt.Sprintf("cd %s && chmod +x install-silent.sh && ./install-silent.sh", quote(path.Join(c.Deploy.RemoteDir, filepath.Base(c.Deploy.SrcDir))))
+		c.Deploy.Command = fmt.Sprintf("cd %s && chmod +x install.sh && ./install.sh", quote(path.Join(c.Deploy.RemoteDir, filepath.Base(c.Deploy.SrcDir))))
 	}
 	if c.Deploy.Mode == "" {
 		c.Deploy.Mode = "hidden"
 	}
 }
-func over(c *Config, src, remote, cmd, mode string) {
+
+func overrideDeploy(c *Config, src, remote, cmd, mode string) {
 	if src != "" {
 		c.Deploy.SrcDir = src
 	}
@@ -325,29 +430,89 @@ func over(c *Config, src, remote, cmd, mode string) {
 		c.Deploy.Mode = mode
 	}
 }
-func hosts(c Config) ([]Host, error) {
+
+func buildHosts(c Config) ([]Host, error) {
 	if len(c.Hosts) == 0 {
 		return nil, errors.New("config hosts is empty")
 	}
+
 	out := make([]Host, 0, len(c.Hosts))
 	for _, n := range c.Hosts {
 		name := strings.TrimSpace(n.Host)
 		if name == "" {
 			return nil, errors.New("host can not be empty")
 		}
-		pass := first(n.Password, c.Defaults.Password)
-		env := first(n.PasswordEnv, c.Defaults.PasswordEnv)
-		if pass == "" && env != "" {
-			pass = os.Getenv(env)
+
+		password, passwordSource, passwordNote := resolvePassword(n, c.Defaults)
+		if passwordNote != "" {
+			logWarn("%s: %s", name, passwordNote)
 		}
-		h := Host{Name: name, User: first(n.User, c.Defaults.User), Port: firstInt(n.Port, c.Defaults.Port), Password: pass, Key: first(n.Key, c.Defaults.Key)}
+
+		key, keySource := resolveKey(n, c.Defaults)
+		h := Host{
+			Name:           name,
+			User:           first(n.User, c.Defaults.User),
+			Port:           firstInt(n.Port, c.Defaults.Port),
+			Password:       password,
+			PasswordSource: passwordSource,
+			Key:            key,
+			KeySource:      keySource,
+		}
 		if h.Password == "" && h.Key == "" {
-			return nil, fmt.Errorf("%s has no password or key", h.Name)
+			return nil, fmt.Errorf("%s has no password or key; configure host/defaults password, password_env, or key", h.Name)
 		}
 		out = append(out, h)
 	}
 	return out, nil
 }
+
+func resolvePassword(n Node, d Auth) (password, source, note string) {
+	if n.Password != "" {
+		return n.Password, "host.password", ""
+	}
+	if d.Password != "" {
+		return d.Password, "defaults.password", ""
+	}
+	if n.PasswordEnv != "" {
+		v := os.Getenv(n.PasswordEnv)
+		if v == "" {
+			return "", "", fmt.Sprintf("password_env %q is set on host but environment variable is empty", n.PasswordEnv)
+		}
+		return v, "env(" + n.PasswordEnv + ")", ""
+	}
+	if d.PasswordEnv != "" {
+		v := os.Getenv(d.PasswordEnv)
+		if v == "" {
+			return "", "", fmt.Sprintf("defaults.password_env %q is set but environment variable is empty", d.PasswordEnv)
+		}
+		return v, "env(" + d.PasswordEnv + ")", ""
+	}
+	return "", "", ""
+}
+
+func resolveKey(n Node, d Auth) (key, source string) {
+	if n.Key != "" {
+		return n.Key, "host.key"
+	}
+	if d.Key != "" {
+		return d.Key, "defaults.key"
+	}
+	return "", ""
+}
+
+func logHostAuthPlan(hs []Host) {
+	for _, h := range hs {
+		methods := []string{}
+		if h.Key != "" {
+			methods = append(methods, "publickey:"+h.KeySource)
+		}
+		if h.Password != "" {
+			methods = append(methods, "password:"+h.PasswordSource)
+		}
+		logDebug("%s: user=%s port=%d auth=%s", h.Name, h.User, h.Port, strings.Join(methods, ","))
+	}
+}
+
 func localOK(p string) error {
 	if _, err := os.Stat(p); err != nil {
 		return fmt.Errorf("local path not accessible: %w", err)
@@ -369,6 +534,7 @@ func copyOne(c Config, h Host) error {
 	logInfo("%s: upload done", h.Name)
 	return nil
 }
+
 func execHidden(c Config, h Host, cmd string) Result {
 	logInfo("%s: executing hidden", h.Name)
 	cl, err := sshClient(c, h)
@@ -378,10 +544,11 @@ func execHidden(c Config, h Host, cmd string) Result {
 	defer cl.Close()
 	out, code, err := runHidden(cl, cmd)
 	if strings.TrimSpace(out) != "" {
-		fmt.Printf("[REMOTE:%s]\n%s\n", h.Name, strings.TrimRight(out, "\n"))
+		logger.remoteOutput(h.Name, out, true)
 	}
 	return Result{Host: h.Name, ExitCode: code, Err: err}
 }
+
 func execVisible(c Config, h Host, cmd string) Result {
 	logInfo("%s: executing visible", h.Name)
 	cl, err := sshClient(c, h)
@@ -390,10 +557,13 @@ func execVisible(c Config, h Host, cmd string) Result {
 	}
 	defer cl.Close()
 	fmt.Printf("\n========== %s ==========\n", h.Name)
+	logger.filePrintf("========== %s visible start =========="+"\n", h.Name)
 	code, err := runVisible(cl, cmd)
 	fmt.Printf("========== %s exit=%d ==========\n\n", h.Name, code)
+	logger.filePrintf("========== %s visible exit=%d =========="+"\n", h.Name, code)
 	return Result{Host: h.Name, ExitCode: code, Err: err}
 }
+
 func trustAdd(c Config, h Host, line, mark string) error {
 	cl, err := sshClient(c, h)
 	if err != nil {
@@ -430,6 +600,7 @@ func trustAdd(c Config, h Host, line, mark string) error {
 	logInfo("%s: trust key added", h.Name)
 	return nil
 }
+
 func trustRemove(c Config, h Host, pre, mark string) error {
 	cl, err := sshClient(c, h)
 	if err != nil {
@@ -474,19 +645,32 @@ func trustRemove(c Config, h Host, pre, mark string) error {
 	}
 	return writeRemote(sc, file, newc, 0600)
 }
+
 func sshClient(c Config, h Host) (*ssh.Client, error) {
-	auth, err := auths(h)
+	auth, methods, err := auths(h)
 	if err != nil {
 		return nil, err
 	}
+	logDebug("%s: connecting as %s:%d using %s", h.Name, h.User, h.Port, strings.Join(methods, ","))
 	conf := &ssh.ClientConfig{User: h.User, Auth: auth, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: c.Timeout}
-	return ssh.Dial("tcp", net.JoinHostPort(h.Name, fmt.Sprintf("%d", h.Port)), conf)
+	cl, err := ssh.Dial("tcp", net.JoinHostPort(h.Name, fmt.Sprintf("%d", h.Port)), conf)
+	if err != nil {
+		return nil, fmt.Errorf("%w; user=%s port=%d auth=%s", err, h.User, h.Port, strings.Join(methods, ","))
+	}
+	return cl, nil
 }
-func auths(h Host) ([]ssh.AuthMethod, error) {
+
+func auths(h Host) ([]ssh.AuthMethod, []string, error) {
 	var a []ssh.AuthMethod
+	var methods []string
+
 	if h.Key != "" {
-		if s, err := loadKey(expand(h.Key)); err == nil {
-			a = append(a, ssh.PublicKeys(s))
+		signer, err := loadKey(expand(h.Key))
+		if err != nil {
+			logWarn("%s: key %q from %s is not usable: %v", h.Name, h.Key, h.KeySource, err)
+		} else {
+			a = append(a, ssh.PublicKeys(signer))
+			methods = append(methods, "publickey:"+h.KeySource)
 		}
 	}
 	if h.Password != "" {
@@ -497,12 +681,14 @@ func auths(h Host) ([]ssh.AuthMethod, error) {
 			}
 			return ans, nil
 		}))
+		methods = append(methods, "password:"+h.PasswordSource, "keyboard-interactive:"+h.PasswordSource)
 	}
 	if len(a) == 0 {
-		return nil, errors.New("no auth method available")
+		return nil, nil, errors.New("no auth method available; configure password/password_env or key")
 	}
-	return a, nil
+	return a, methods, nil
 }
+
 func upload(cl *ssh.Client, src, remoteDir string) error {
 	sc, err := sftp.NewClient(cl)
 	if err != nil {
@@ -515,6 +701,7 @@ func upload(cl *ssh.Client, src, remoteDir string) error {
 	}
 	dst := path.Join(remoteDir, filepath.Base(src))
 	if !st.IsDir() {
+		logDebug("upload file %s -> %s", src, dst)
 		return upFile(sc, src, dst, st.Mode())
 	}
 	return filepath.WalkDir(src, func(p string, d os.DirEntry, e error) error {
@@ -534,14 +721,18 @@ func upload(cl *ssh.Client, src, remoteDir string) error {
 		}
 		rp := path.Join(dst, filepath.ToSlash(rel))
 		if d.IsDir() {
+			logTrace("mkdir %s", rp)
 			return sc.MkdirAll(rp)
 		}
 		if !info.Mode().IsRegular() {
+			logDebug("skip non-regular file: %s", p)
 			return nil
 		}
+		logTrace("upload file %s -> %s", p, rp)
 		return upFile(sc, p, rp, info.Mode())
 	})
 }
+
 func upFile(sc *sftp.Client, src, dst string, mode os.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -561,6 +752,7 @@ func upFile(sc *sftp.Client, src, dst string, mode os.FileMode) error {
 	}
 	return sc.Chmod(dst, mode)
 }
+
 func runHidden(cl *ssh.Client, cmd string) (string, int, error) {
 	s, err := cl.NewSession()
 	if err != nil {
@@ -570,24 +762,27 @@ func runHidden(cl *ssh.Client, cmd string) (string, int, error) {
 	out, err := s.CombinedOutput(cmd)
 	return string(out), exitCode(err), err
 }
+
 func runVisible(cl *ssh.Client, cmd string) (int, error) {
 	s, err := cl.NewSession()
 	if err != nil {
 		return -1, err
 	}
 	defer s.Close()
-	s.Stdout = os.Stdout
-	s.Stderr = os.Stderr
+	s.Stdout = logger.visibleWriter(os.Stdout)
+	s.Stderr = logger.visibleWriter(os.Stderr)
 	s.Stdin = os.Stdin
 	if err := s.Run(cmd); err != nil {
 		return exitCode(err), err
 	}
 	return 0, nil
 }
+
 func run(cl *ssh.Client, cmd string) (string, error) {
 	out, _, err := runHidden(cl, cmd)
 	return out, err
 }
+
 func home(cl *ssh.Client) (string, error) {
 	out, err := run(cl, `printf %s "$HOME"`)
 	if err != nil {
@@ -599,6 +794,7 @@ func home(cl *ssh.Client) (string, error) {
 	}
 	return strings.Trim(h, `"`), nil
 }
+
 func exitCode(err error) int {
 	if err == nil {
 		return 0
@@ -609,8 +805,10 @@ func exitCode(err error) int {
 	}
 	return -1
 }
+
 func ensureKey(p string) error {
 	if _, err := os.Stat(p); err == nil {
+		logDebug("reuse existing key: %s", p)
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
@@ -634,6 +832,7 @@ func ensureKey(p string) error {
 	logInfo("generated key: %s", p)
 	return nil
 }
+
 func pubLine(p string) (string, string, error) {
 	s, err := loadKey(p)
 	if err != nil {
@@ -642,6 +841,7 @@ func pubLine(p string) (string, string, error) {
 	mark := markerPrefix + ":" + ssh.FingerprintSHA256(s.PublicKey())
 	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(s.PublicKey()))) + " " + mark + "\n", mark, nil
 }
+
 func loadKey(p string) (ssh.Signer, error) {
 	b, err := os.ReadFile(p)
 	if err != nil {
@@ -649,6 +849,7 @@ func loadKey(p string) (ssh.Signer, error) {
 	}
 	return ssh.ParsePrivateKey(b)
 }
+
 func readRemote(sc *sftp.Client, p string) (string, error) {
 	f, err := sc.Open(p)
 	if err != nil {
@@ -658,6 +859,7 @@ func readRemote(sc *sftp.Client, p string) (string, error) {
 	b, err := io.ReadAll(f)
 	return string(b), err
 }
+
 func writeRemote(sc *sftp.Client, p, s string, m os.FileMode) error {
 	f, err := sc.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
 	if err != nil {
@@ -669,6 +871,7 @@ func writeRemote(sc *sftp.Client, p, s string, m os.FileMode) error {
 	}
 	return sc.Chmod(p, m)
 }
+
 func batch(hs []Host, n int, fn func(Host) Result) []Result {
 	if n <= 0 {
 		n = 1
@@ -699,20 +902,24 @@ func batch(hs []Host, n int, fn func(Host) Result) []Result {
 	}
 	return rs
 }
+
 func summary(rs []Result) error {
 	fail := 0
-	fmt.Println("\nSummary:")
+	msg := "\nSummary:"
+	fmt.Println(msg)
+	logger.filePrintf(msg + "\n")
 	for _, r := range rs {
 		st := "OK"
 		if r.Err != nil {
 			st = "FAILED"
 			fail++
 		}
-		fmt.Printf("  %-15s %-7s exit=%d", r.Host, st, r.ExitCode)
+		line := fmt.Sprintf("  %-15s %-7s exit=%d", r.Host, st, r.ExitCode)
 		if r.Err != nil {
-			fmt.Printf(" err=%v", r.Err)
+			line += fmt.Sprintf(" err=%v", r.Err)
 		}
-		fmt.Println()
+		fmt.Println(line)
+		logger.filePrintf(line + "\n")
 	}
 	if fail > 0 {
 		return fmt.Errorf("completed with %d failed host(s)", fail)
@@ -720,14 +927,21 @@ func summary(rs []Result) error {
 	logInfo("all hosts completed successfully")
 	return nil
 }
+
 func result(host string, err error) Result { return Result{Host: host, ExitCode: exitCode(err), Err: err} }
+
 func defaultYAML() string {
 	return `concurrency: 5
 timeout: 30s
 
+logging:
+  file: "deployctl.log"
+  level: "info"
+
 defaults:
   user: root
   port: 22
+  # password: "your-password"
   password_env: "SSHPASS"
   key: "~/.ssh/deployctl_id_rsa"
 
@@ -735,22 +949,161 @@ trust:
   managed_key: "~/.ssh/deployctl_id_rsa"
 
 deploy:
-  src_dir: "AnyBackupClient"
+  src_dir: "local-package"
   remote_dir: "/opt"
-  command: "cd /opt/AnyBackupClient && chmod +x install-silent.sh && ./install-silent.sh"
+  command: "cd /opt/local-package && chmod +x install.sh && ./install.sh"
   mode: hidden
 
 hosts:
-  - host: 10.71.43.6
-  - host: 10.71.43.7
-  - host: 10.71.43.8
-`}
-func keyPrefix(l string) string { f := strings.Fields(l); if len(f)<2 { return strings.TrimSpace(l) }; return f[0]+" "+f[1] }
-func hasKey(s, pre string) bool { for _, l := range strings.Split(s,"\n") { if strings.HasPrefix(strings.TrimSpace(l), pre) { return true } }; return false }
-func expand(p string) string { if p=="~" { h,_:=os.UserHomeDir(); return h }; if strings.HasPrefix(p,"~/") { h,_:=os.UserHomeDir(); return filepath.Join(h,p[2:]) }; return p }
-func quote(s string) string { return "'"+strings.ReplaceAll(s,"'",`'\''`)+"'" }
-func first(v ...string) string { for _,x := range v { if x!="" { return x } }; return "" }
-func firstInt(v ...int) int { for _,x := range v { if x>0 { return x } }; return 0 }
-func def(v,d string) string { if v!="" { return v }; return d }
-func logInfo(f string,a ...any){ fmt.Printf("[INFO] "+f+"\n",a...) }
-func logErr(f string,a ...any){ fmt.Fprintf(os.Stderr,"[ERROR] "+f+"\n",a...) }
+  - host: 192.168.1.10
+  - host: 192.168.1.11
+  - host: 192.168.1.12
+`
+}
+
+func (l *Logger) open(file string, verbosity int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.verbosity = verbosity
+	if file == "" || file == "-" {
+		return
+	}
+	dir := filepath.Dir(file)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] create log dir failed: %v\n", err)
+			return
+		}
+	}
+	f, err := os.OpenFile(file, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] open log file failed: %v\n", err)
+		return
+	}
+	l.file = f
+	l.filePrintf("\n===== deployctl started at %s =====\n", time.Now().Format(time.RFC3339))
+}
+
+func (l *Logger) close() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file != nil {
+		_ = l.file.Close()
+		l.file = nil
+	}
+}
+
+func (l *Logger) log(level string, screenMin int, format string, args ...any) {
+	line := fmt.Sprintf("[%s] %s", level, fmt.Sprintf(format, args...))
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file != nil {
+		_, _ = fmt.Fprintln(l.file, time.Now().Format(time.RFC3339), line)
+	}
+	if l.verbosity >= screenMin || screenMin == 0 {
+		if level == "ERROR" || level == "WARN" {
+			fmt.Fprintln(os.Stderr, line)
+		} else {
+			fmt.Println(line)
+		}
+	}
+}
+
+func (l *Logger) filePrintf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file != nil {
+		_, _ = fmt.Fprintf(l.file, format, args...)
+	}
+}
+
+func (l *Logger) remoteOutput(host, out string, screen bool) {
+	text := fmt.Sprintf("[REMOTE:%s]\n%s\n", host, strings.TrimRight(out, "\n"))
+	l.filePrintf(text)
+	if screen {
+		fmt.Print(text)
+	}
+}
+
+func (l *Logger) visibleWriter(w io.Writer) io.Writer {
+	l.mu.Lock()
+	f := l.file
+	l.mu.Unlock()
+	if f == nil {
+		return w
+	}
+	return io.MultiWriter(w, f)
+}
+
+func logInfo(f string, a ...any)  { logger.log("INFO", 0, f, a...) }
+func logWarn(f string, a ...any)  { logger.log("WARN", 0, f, a...) }
+func logErr(f string, a ...any)   { logger.log("ERROR", 0, f, a...) }
+func logDebug(f string, a ...any) { logger.log("DEBUG", 1, f, a...) }
+func logTrace(f string, a ...any) { logger.log("TRACE", 3, f, a...) }
+
+func levelToVerbosity(level string) int {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return 1
+	case "trace":
+		return 3
+	default:
+		return 0
+	}
+}
+
+func keyPrefix(l string) string {
+	f := strings.Fields(l)
+	if len(f) < 2 {
+		return strings.TrimSpace(l)
+	}
+	return f[0] + " " + f[1]
+}
+func hasKey(s, pre string) bool {
+	for _, l := range strings.Split(s, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), pre) {
+			return true
+		}
+	}
+	return false
+}
+func expand(p string) string {
+	if p == "~" {
+		h, _ := os.UserHomeDir()
+		return h
+	}
+	if strings.HasPrefix(p, "~/") {
+		h, _ := os.UserHomeDir()
+		return filepath.Join(h, p[2:])
+	}
+	return p
+}
+func quote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+func first(v ...string) string {
+	for _, x := range v {
+		if x != "" {
+			return x
+		}
+	}
+	return ""
+}
+func firstInt(v ...int) int {
+	for _, x := range v {
+		if x > 0 {
+			return x
+		}
+	}
+	return 0
+}
+func def(v, d string) string {
+	if v != "" {
+		return v
+	}
+	return d
+}
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
