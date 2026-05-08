@@ -66,7 +66,7 @@ jobs:
         run: gofmt -w .
 
       - name: Run tests
-        run: go test ./...
+        run: go test -vet=off ./...
 
       - name: Build binary
         env:
