@@ -1,58 +1,163 @@
 # deployctl
 
-`deployctl` 是一个轻量的 Go 批量 SSH/SFTP 运维工具，适合在多台 Linux 主机上批量配置 SSH 免密、复制文件或目录、执行远程命令，以及执行“复制后运行命令”的部署流程。
+`deployctl` 是一个用 Go 编写的轻量批量 SSH/SFTP 运维工具。它面向“我有一批 Linux 主机，需要批量复制文件、执行命令、安装脚本、配置 SSH 免密”的场景。
 
-它不依赖 `ssh-copy-id`、`rsync`、`scp` 等外部工具，主要通过 Go SSH/SFTP 实现。
+它的目标不是替代 Ansible 这类完整配置管理系统，而是提供一个简单、单文件可执行、配置清晰、适合内网批量初始化和批量部署的小工具。
 
-## 功能特性
+## 这个软件能做什么
 
-- 支持 SSH 密码认证，可用于类似 `sshpass` 的场景。
+`deployctl` 可以帮你完成这些工作：
+
+- 批量连接多台 Linux 主机。
+- 支持 SSH 密码认证，适合类似 `sshpass` 的使用场景。
 - 支持 SSH 私钥认证。
-- 支持 YAML 配置多台主机。
-- 支持每台主机单独配置 `user`、`port`、`password`、`password_env`、`key`。
-- 单台主机未配置密码时，会自动回退使用 `defaults.password` 或 `defaults.password_env`。
-- 支持批量配置 SSH 免密，不依赖 `ssh-copy-id`。
-- 支持批量取消由本工具配置的 SSH 免密。
-- 支持批量复制本地文件或目录到远端主机。
+- 支持给多台机器批量配置 SSH 免密。
+- 支持取消由本工具配置的 SSH 免密。
 - 支持批量执行远程命令。
-- 支持复制文件或目录后再执行远程命令。
-- 支持隐藏执行模式：并发执行，最后汇总每台主机结果。
-- 支持可见执行模式：单进程逐台执行，实时显示远程命令输出，便于观察脚本过程，也便于随时中断。
-- 支持日志文件、详细日志参数 `-v` / `-vv` / `-vvv`。
-- 支持生成默认配置文件。
+- 支持批量复制本地文件或目录到远端机器。
+- 支持“先复制文件或目录，再执行远程命令”的部署流程。
+- 支持 YAML 配置多台机器，并允许每台机器单独配置用户名、端口、密码、环境变量或私钥。
+- 支持并发执行，也支持逐台可见执行。
+- 支持日志文件和详细日志级别，方便排查问题。
+- 支持 GitHub Actions 手动构建，并可发布到 GitHub Releases。
 
-## 构建
+## 适合哪些场景
+
+常见适用场景：
+
+- 一批新机器需要批量配置 SSH 免密。
+- 一批机器需要批量上传安装包、脚本或配置目录。
+- 一批机器需要批量执行初始化命令。
+- 希望不用 `ssh-copy-id`、`rsync`、`scp`、`sshpass`，只用一个 Go 可执行文件完成批量操作。
+- 希望用 YAML 管理主机清单和认证信息。
+- 希望安装脚本执行时可以实时看到输出，也能在普通批量任务中并发执行。
+
+## 不适合哪些场景
+
+`deployctl` 不是完整的配置管理系统，不适合复杂的状态编排、幂等资源管理、角色系统、模板渲染、任务依赖编排等复杂场景。需要这些能力时，Ansible、SaltStack、Puppet、Chef 等工具会更合适。
+
+## 核心命令
 
 ```bash
+# 生成默认配置
+./deployctl init -o config.yaml
+
+# 批量配置 SSH 免密
+./deployctl trust-add -c config.yaml
+
+# 批量取消由 deployctl 配置的 SSH 免密
+./deployctl trust-remove -c config.yaml
+
+# 批量复制文件或目录
+./deployctl copy -c config.yaml --src ./local-package --remote-dir /opt
+
+# 批量执行远程命令
+./deployctl exec -c config.yaml --cmd "hostname && uptime"
+
+# 按 deploy 配置执行：可复制、可执行、也可复制后执行
+./deployctl deploy -c config.yaml
+```
+
+## deploy 的行为规则
+
+`deploy` 是一个组合命令，行为由 `deploy` 配置决定。
+
+```yaml
+deploy:
+  src_dir: ""
+  remote_dir: ""
+  command: ""
+  mode: hidden
+```
+
+规则如下：
+
+| 配置 | 行为 |
+|---|---|
+| `src_dir` + `remote_dir` + `command` | 先复制，再执行命令 |
+| `src_dir` + `remote_dir` | 只复制文件或目录，不执行命令 |
+| `command` | 只执行命令，不复制文件 |
+| 三者都为空 | 报错提示 |
+
+也就是说，如果你只想复制文件，不要配置 `command`。如果你只想执行命令，不要配置 `src_dir` 和 `remote_dir`。
+
+## 执行模式
+
+`deployctl` 支持两种执行模式。
+
+### hidden
+
+```bash
+./deployctl deploy -c config.yaml --mode hidden
+```
+
+特点：
+
+- 按 `concurrency` 并发执行。
+- 远程输出在命令结束后显示。
+- 最后汇总每台机器的状态和退出码。
+- 适合稳定、不需要实时观察过程的批量任务。
+
+### visible
+
+```bash
+./deployctl deploy -c config.yaml --mode visible
+```
+
+特点：
+
+- 单进程逐台执行。
+- 远程 stdout/stderr 实时显示在当前终端。
+- 远程输出也会写入日志文件。
+- 适合安装脚本、初始化脚本、长时间任务。
+- 执行过程中可以用 `Ctrl+C` 中断。
+
+## 安装和构建
+
+### 从源码构建
+
+```bash
+git clone https://github.com/fanhuadesenlinnn/deployctl.git
+cd deployctl
 go mod tidy
-go build -o deployctl .
+go build -o deployctl ./cmd/deployctl
 ```
 
 交叉编译 Linux amd64：
 
 ```bash
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o deployctl-linux-amd64 .
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o deployctl-linux-amd64 ./cmd/deployctl
 ```
 
-也可以使用 GitHub Actions 中的手动构建工作流：
+### 使用 GitHub Actions 构建
+
+仓库中提供手动触发的构建工作流：
 
 ```text
 Actions -> Build deployctl -> Run workflow
 ```
 
-## 生成默认配置
+可以填写版本号，例如：
+
+```text
+v0.1.0
+```
+
+如果 `publish_release` 为 `true`，构建产物会发布到 GitHub Releases。
+
+## 生成配置文件
 
 ```bash
 ./deployctl init -o config.yaml
 ```
 
-如果配置文件已经存在，需要覆盖：
+如果文件已经存在，需要覆盖：
 
 ```bash
 ./deployctl init -o config.yaml -force
 ```
 
-## 配置文件示例
+生成的配置类似：
 
 ```yaml
 concurrency: 5
@@ -60,12 +165,11 @@ timeout: 30s
 
 logging:
   file: "deployctl.log"
-  level: "info" # info, debug, trace
+  level: "info"
 
 defaults:
   user: root
   port: 22
-  # password: "your-password"
   password_env: "SSHPASS"
   key: "~/.ssh/deployctl_id_rsa"
 
@@ -73,9 +177,9 @@ trust:
   managed_key: "~/.ssh/deployctl_id_rsa"
 
 deploy:
-  src_dir: "local-package"
-  remote_dir: "/opt"
-  command: "cd /opt/local-package && chmod +x install.sh && ./install.sh"
+  src_dir: ""
+  remote_dir: ""
+  command: ""
   mode: hidden
 
 hosts:
@@ -84,7 +188,74 @@ hosts:
   - host: 192.168.1.12
 ```
 
-不同主机可以覆盖默认认证信息：
+## 配置说明
+
+### 并发和超时
+
+```yaml
+concurrency: 5
+timeout: 30s
+```
+
+`concurrency` 控制 hidden 模式下的并发数量。`timeout` 控制 SSH 连接超时时间。
+
+### 日志
+
+```yaml
+logging:
+  file: "deployctl.log"
+  level: "info"
+```
+
+也可以在命令行临时指定日志文件：
+
+```bash
+./deployctl deploy -c config.yaml --log-file ./logs/deploy.log
+```
+
+详细日志：
+
+```bash
+./deployctl deploy -c config.yaml -v
+./deployctl deploy -c config.yaml -vv
+./deployctl deploy -c config.yaml -vvv
+```
+
+说明：
+
+- 默认显示普通信息、警告和错误。
+- `-v` 显示认证来源、配置文件、日志文件等调试信息。
+- `-vvv` 显示更细的上传过程日志。
+- 日志文件会记录屏幕日志、远程输出和执行汇总。
+
+### 默认认证信息
+
+```yaml
+defaults:
+  user: root
+  port: 22
+  password_env: "SSHPASS"
+  key: "~/.ssh/deployctl_id_rsa"
+```
+
+统一密码建议用环境变量：
+
+```bash
+export SSHPASS='your-password'
+```
+
+也可以直接配置默认密码：
+
+```yaml
+defaults:
+  user: root
+  port: 22
+  password: "your-password"
+```
+
+不建议把真实密码写进配置文件，除非是在受控环境中临时使用。
+
+### 单台机器覆盖配置
 
 ```yaml
 hosts:
@@ -102,9 +273,7 @@ hosts:
     key: "~/.ssh/custom_id_rsa"
 ```
 
-## 密码认证优先级
-
-单台主机没有配置密码时，会继续尝试默认配置。优先级如下：
+密码优先级：
 
 ```text
 host.password
@@ -113,51 +282,20 @@ host.password
 -> env(defaults.password_env)
 ```
 
-统一密码可以使用环境变量，避免把密码明文写入配置：
-
-```bash
-export SSHPASS='your-password'
-./deployctl exec -c config.yaml --cmd "hostname && uptime"
-```
-
-也可以在 YAML 中给单台主机配置 `password` 或 `password_env`。
-
-## 日志和详细输出
-
-默认会将日志写入配置中的 `logging.file`，例如：
-
-```yaml
-logging:
-  file: "deployctl.log"
-  level: "info"
-```
-
-也可以在命令行临时指定日志文件：
-
-```bash
-./deployctl deploy -c config.yaml --log-file ./logs/deployctl.log
-```
-
-详细输出参数：
-
-```bash
-./deployctl deploy -c config.yaml -v
-./deployctl deploy -c config.yaml -vv
-./deployctl deploy -c config.yaml -vvv
-```
-
-说明：
-
-- 默认屏幕显示普通信息、警告、错误。
-- `-v` 会在屏幕显示认证来源、配置文件、日志文件等调试信息。
-- `-vvv` 会显示更细的上传过程日志。
-- 日志文件会记录屏幕日志、远程输出和执行汇总。
+如果单台机器没有配置密码，会自动尝试默认密码或默认环境变量。
 
 ## 批量配置 SSH 免密
 
+先设置密码环境变量：
+
 ```bash
 export SSHPASS='your-password'
-./deployctl trust-add -c config.yaml
+```
+
+执行：
+
+```bash
+./deployctl trust-add -c config.yaml -v
 ```
 
 默认会在本机生成或复用：
@@ -190,25 +328,9 @@ export SSHPASS='your-password'
 ./deployctl trust-remove -c config.yaml
 ```
 
-## 批量执行命令
+## 只复制文件或目录
 
-隐藏模式，适合多台主机并发执行：
-
-```bash
-./deployctl exec -c config.yaml --cmd "hostname && uptime" --mode hidden
-```
-
-可见模式，适合需要观察执行过程的命令或脚本：
-
-```bash
-./deployctl exec -c config.yaml --cmd "bash /tmp/task.sh" --mode visible
-```
-
-两种模式都会在最后输出汇总信息，包括每台主机的执行状态和退出码。
-
-## 批量复制文件或目录
-
-复制目录：
+使用 `copy` 命令：
 
 ```bash
 ./deployctl copy -c config.yaml --src ./local-package --remote-dir /opt
@@ -222,15 +344,71 @@ export SSHPASS='your-password'
 
 远端路径会自动使用本地文件或目录的 basename。例如 `./local-package` 会复制到 `/opt/local-package`。
 
-## 复制后执行命令
+也可以使用 `deploy` 做只复制：
 
-使用配置文件里的 `deploy` 段：
+```yaml
+deploy:
+  src_dir: "./local-package"
+  remote_dir: "/opt"
+  command: ""
+  mode: hidden
+```
+
+然后执行：
 
 ```bash
 ./deployctl deploy -c config.yaml
 ```
 
-临时覆盖源路径、远端目录、命令和执行模式：
+## 只执行命令
+
+使用 `exec` 命令：
+
+```bash
+./deployctl exec -c config.yaml --cmd "hostname && uptime" --mode hidden
+```
+
+可见执行：
+
+```bash
+./deployctl exec -c config.yaml --cmd "bash /tmp/task.sh" --mode visible
+```
+
+也可以使用 `deploy` 做只执行：
+
+```yaml
+deploy:
+  src_dir: ""
+  remote_dir: ""
+  command: "hostname && uptime"
+  mode: hidden
+```
+
+然后执行：
+
+```bash
+./deployctl deploy -c config.yaml
+```
+
+## 复制后执行命令
+
+配置：
+
+```yaml
+deploy:
+  src_dir: "./local-package"
+  remote_dir: "/opt"
+  command: "cd /opt/local-package && chmod +x install.sh && ./install.sh"
+  mode: visible
+```
+
+执行：
+
+```bash
+./deployctl deploy -c config.yaml
+```
+
+也可以临时用命令行覆盖：
 
 ```bash
 ./deployctl deploy \
@@ -241,57 +419,34 @@ export SSHPASS='your-password'
   --mode visible
 ```
 
-## 执行模式说明
-
-### hidden
-
-```bash
-./deployctl deploy -c config.yaml --mode hidden
-```
-
-特点：
-
-- 按 `concurrency` 并发执行。
-- 远程输出会在命令结束后显示。
-- 最后汇总每台主机的结果和退出码。
-- 适合稳定、无需人工观察的批量任务。
-
-### visible
-
-```bash
-./deployctl deploy -c config.yaml --mode visible
-```
-
-特点：
-
-- 单进程逐台执行。
-- 远程 stdout/stderr 实时显示在当前终端，并同步写入日志文件。
-- 适合安装脚本、初始化脚本、长时间任务。
-- 运行过程中可以用 `Ctrl+C` 中断。
-
-## 常见流程
+## 推荐使用流程
 
 ```bash
 # 1. 生成配置
 ./deployctl init -o config.yaml
 
-# 2. 编辑 config.yaml 中的 hosts、认证信息、部署参数、日志配置
+# 2. 编辑主机清单、认证方式、日志和部署配置
 vim config.yaml
 
-# 3. 使用密码批量配置免密
+# 3. 用密码批量配置免密
 export SSHPASS='your-password'
 ./deployctl trust-add -c config.yaml -v
 
-# 4. 使用免密批量复制并执行部署命令
+# 4. 批量复制或部署
 ./deployctl deploy -c config.yaml --mode visible --log-file ./logs/deploy.log
 
-# 5. 如需取消由本工具配置的免密
+# 5. 需要时取消由 deployctl 配置的免密
 ./deployctl trust-remove -c config.yaml
 ```
 
 ## 注意事项
 
 - 文件复制使用 SFTP 递归上传，不是 rsync 差异同步协议。
-- 默认跳过严格的 known_hosts 校验，适合内网初始化和批量运维场景；生产环境如需更高安全性，建议后续增加 known_hosts 校验。
+- 默认跳过严格的 known_hosts 校验，适合内网初始化和批量运维场景。
+- 生产环境如需更高安全性，建议后续增加 known_hosts 校验。
 - `visible` 模式适合观察过程；`hidden` 模式适合批量并发。
 - 不建议把真实密码直接写进配置文件，优先使用 `password_env`。
+
+## License
+
+This project is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE) for details.
