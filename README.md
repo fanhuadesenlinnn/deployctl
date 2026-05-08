@@ -10,6 +10,7 @@
 - 支持 SSH 私钥认证。
 - 支持 YAML 配置多台主机。
 - 支持每台主机单独配置 `user`、`port`、`password`、`password_env`、`key`。
+- 单台主机未配置密码时，会自动回退使用 `defaults.password` 或 `defaults.password_env`。
 - 支持批量配置 SSH 免密，不依赖 `ssh-copy-id`。
 - 支持批量取消由本工具配置的 SSH 免密。
 - 支持批量复制本地文件或目录到远端主机。
@@ -17,6 +18,7 @@
 - 支持复制文件或目录后再执行远程命令。
 - 支持隐藏执行模式：并发执行，最后汇总每台主机结果。
 - 支持可见执行模式：单进程逐台执行，实时显示远程命令输出，便于观察脚本过程，也便于随时中断。
+- 支持日志文件、详细日志参数 `-v` / `-vv` / `-vvv`。
 - 支持生成默认配置文件。
 
 ## 构建
@@ -56,9 +58,14 @@ Actions -> Build deployctl -> Run workflow
 concurrency: 5
 timeout: 30s
 
+logging:
+  file: "deployctl.log"
+  level: "info" # info, debug, trace
+
 defaults:
   user: root
   port: 22
+  # password: "your-password"
   password_env: "SSHPASS"
   key: "~/.ssh/deployctl_id_rsa"
 
@@ -95,7 +102,16 @@ hosts:
     key: "~/.ssh/custom_id_rsa"
 ```
 
-## 密码认证
+## 密码认证优先级
+
+单台主机没有配置密码时，会继续尝试默认配置。优先级如下：
+
+```text
+host.password
+-> defaults.password
+-> env(host.password_env)
+-> env(defaults.password_env)
+```
 
 统一密码可以使用环境变量，避免把密码明文写入配置：
 
@@ -105,6 +121,37 @@ export SSHPASS='your-password'
 ```
 
 也可以在 YAML 中给单台主机配置 `password` 或 `password_env`。
+
+## 日志和详细输出
+
+默认会将日志写入配置中的 `logging.file`，例如：
+
+```yaml
+logging:
+  file: "deployctl.log"
+  level: "info"
+```
+
+也可以在命令行临时指定日志文件：
+
+```bash
+./deployctl deploy -c config.yaml --log-file ./logs/deployctl.log
+```
+
+详细输出参数：
+
+```bash
+./deployctl deploy -c config.yaml -v
+./deployctl deploy -c config.yaml -vv
+./deployctl deploy -c config.yaml -vvv
+```
+
+说明：
+
+- 默认屏幕显示普通信息、警告、错误。
+- `-v` 会在屏幕显示认证来源、配置文件、日志文件等调试信息。
+- `-vvv` 会显示更细的上传过程日志。
+- 日志文件会记录屏幕日志、远程输出和执行汇总。
 
 ## 批量配置 SSH 免密
 
@@ -218,7 +265,7 @@ export SSHPASS='your-password'
 特点：
 
 - 单进程逐台执行。
-- 远程 stdout/stderr 实时显示在当前终端。
+- 远程 stdout/stderr 实时显示在当前终端，并同步写入日志文件。
 - 适合安装脚本、初始化脚本、长时间任务。
 - 运行过程中可以用 `Ctrl+C` 中断。
 
@@ -228,15 +275,15 @@ export SSHPASS='your-password'
 # 1. 生成配置
 ./deployctl init -o config.yaml
 
-# 2. 编辑 config.yaml 中的 hosts、认证信息、部署参数
+# 2. 编辑 config.yaml 中的 hosts、认证信息、部署参数、日志配置
 vim config.yaml
 
 # 3. 使用密码批量配置免密
 export SSHPASS='your-password'
-./deployctl trust-add -c config.yaml
+./deployctl trust-add -c config.yaml -v
 
 # 4. 使用免密批量复制并执行部署命令
-./deployctl deploy -c config.yaml --mode visible
+./deployctl deploy -c config.yaml --mode visible --log-file ./logs/deploy.log
 
 # 5. 如需取消由本工具配置的免密
 ./deployctl trust-remove -c config.yaml
