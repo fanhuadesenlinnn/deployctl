@@ -17,9 +17,13 @@ trust:
   managed_key: "~/.ssh/deployctl_id_rsa"
 
 deploy:
-  src_dir: "local-package"
-  remote_dir: "/opt"
-  command: "cd /opt/local-package && chmod +x install.sh && ./install.sh"
+  # deploy has flexible behavior:
+  # 1. src_dir + remote_dir + command: copy first, then execute command
+  # 2. src_dir + remote_dir: copy only
+  # 3. command: execute only
+  src_dir: ""
+  remote_dir: ""
+  command: ""
   mode: hidden # hidden or visible
 
 hosts:
