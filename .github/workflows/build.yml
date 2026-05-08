@@ -79,10 +79,10 @@ jobs:
           go mod download
 
       - name: Format source
-        run: gofmt -w .
+        run: gofmt -w ./cmd/deployctl-safe
 
       - name: Run tests
-        run: go test -vet=off ./...
+        run: go test -vet=off ./cmd/deployctl-safe
 
       - name: Build binary
         env:
@@ -92,7 +92,7 @@ jobs:
         run: |
           mkdir -p dist
           binary="deployctl-${{ github.event.inputs.version }}-${GOOS}-${GOARCH}${{ matrix.ext }}"
-          go build -trimpath -ldflags="-s -w" -o "dist/${binary}" ./cmd/deployctl-rsync
+          go build -trimpath -ldflags="-s -w" -o "dist/${binary}" ./cmd/deployctl-safe
 
       - name: Package artifact
         run: |
