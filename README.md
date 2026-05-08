@@ -1,6 +1,6 @@
 # deployctl
 
-`deployctl` 是一个用 Go 编写的轻量批量 SSH/SFTP 运维工具。它面向“我有一批 Linux 主机，需要批量复制文件、执行命令、安装脚本、配置 SSH 免密”的场景。
+`deployctl` 是一个用 Go 编写的轻量批量 SSH/SFTP/rsync 运维工具。它面向“我有一批 Linux 主机，需要批量复制文件、执行命令、安装脚本、配置 SSH 免密”的场景。
 
 它的目标不是替代 Ansible 这类完整配置管理系统，而是提供一个简单、单文件可执行、配置清晰、适合内网批量初始化和批量部署的小工具。
 
@@ -15,6 +15,7 @@
 - 支持取消由本工具配置的 SSH 免密。
 - 支持批量执行远程命令。
 - 支持批量复制本地文件或目录到远端机器。
+- 复制模块支持 SFTP，也支持在条件满足时使用 rsync。
 - 支持“先复制文件或目录，再执行远程命令”的部署流程。
 - 支持 YAML 配置多台机器，并允许每台机器单独配置用户名、端口、密码、环境变量或私钥。
 - 支持并发执行，也支持逐台可见执行。
@@ -28,7 +29,8 @@
 - 一批新机器需要批量配置 SSH 免密。
 - 一批机器需要批量上传安装包、脚本或配置目录。
 - 一批机器需要批量执行初始化命令。
-- 希望不用 `ssh-copy-id`、`rsync`、`scp`、`sshpass`，只用一个 Go 可执行文件完成批量操作。
+- 希望不用 `ssh-copy-id`、`scp`、`sshpass`，只用一个 Go 可执行文件完成批量操作。
+- 机器支持 rsync 时，希望复制目录可以走 rsync；不支持时仍可回退到 SFTP。
 - 希望用 YAML 管理主机清单和认证信息。
 - 希望安装脚本执行时可以实时看到输出，也能在普通批量任务中并发执行。
 
@@ -48,8 +50,14 @@
 # 批量取消由 deployctl 配置的 SSH 免密
 ./deployctl trust-remove -c config.yaml
 
-# 批量复制文件或目录
+# 批量复制文件或目录，默认 SFTP
 ./deployctl copy -c config.yaml --src ./local-package --remote-dir /opt
+
+# 批量复制文件或目录，指定 rsync
+./deployctl copy -c config.yaml --src ./local-package --remote-dir /opt --copy-method rsync
+
+# 自动选择复制方式：rsync 可用则用 rsync，否则回退 SFTP
+./deployctl copy -c config.yaml --src ./local-package --remote-dir /opt --copy-method auto
 
 # 批量执行远程命令
 ./deployctl exec -c config.yaml --cmd "hostname && uptime"
@@ -64,6 +72,7 @@
 
 ```yaml
 deploy:
+  copy_method: sftp
   src_dir: ""
   remote_dir: ""
   command: ""
@@ -80,6 +89,35 @@ deploy:
 | 三者都为空 | 报错提示 |
 
 也就是说，如果你只想复制文件，不要配置 `command`。如果你只想执行命令，不要配置 `src_dir` 和 `remote_dir`。
+
+## 复制方式
+
+`deployctl` 的复制模块支持三种方式：
+
+| copy_method | 说明 |
+|---|---|
+| `sftp` | 默认方式，纯 Go SFTP 实现，不依赖 rsync，支持密码和私钥认证 |
+| `rsync` | 使用系统外部 `rsync` 命令复制，需要本机和远端都安装 rsync，并且 SSH 私钥可用 |
+| `auto` | 自动检测 rsync 是否可用；可用则走 rsync，不可用则回退 SFTP |
+
+配置示例：
+
+```yaml
+deploy:
+  copy_method: auto
+  src_dir: "./local-package"
+  remote_dir: "/opt"
+  command: ""
+  mode: hidden
+```
+
+命令行临时覆盖：
+
+```bash
+./deployctl copy -c config.yaml --src ./local-package --remote-dir /opt --copy-method auto
+```
+
+注意：`rsync` 模式调用的是本机系统上的 `rsync` 命令，并通过系统 `ssh` 连接远端。因此它需要可用的 SSH 私钥或 SSH agent；密码认证场景建议使用 `sftp` 或 `auto`。`auto` 会在 rsync 条件不满足时回退到 SFTP。
 
 ## 执行模式
 
@@ -120,13 +158,13 @@ deploy:
 git clone https://github.com/fanhuadesenlinnn/deployctl.git
 cd deployctl
 go mod tidy
-go build -o deployctl ./cmd/deployctl
+go build -o deployctl ./cmd/deployctl-rsync
 ```
 
 交叉编译 Linux amd64：
 
 ```bash
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o deployctl-linux-amd64 ./cmd/deployctl
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o deployctl-linux-amd64 ./cmd/deployctl-rsync
 ```
 
 ### 使用 GitHub Actions 构建
@@ -177,6 +215,7 @@ trust:
   managed_key: "~/.ssh/deployctl_id_rsa"
 
 deploy:
+  copy_method: sftp
   src_dir: ""
   remote_dir: ""
   command: ""
@@ -336,6 +375,18 @@ export SSHPASS='your-password'
 ./deployctl copy -c config.yaml --src ./local-package --remote-dir /opt
 ```
 
+使用 rsync：
+
+```bash
+./deployctl copy -c config.yaml --src ./local-package --remote-dir /opt --copy-method rsync
+```
+
+自动选择 rsync 或 SFTP：
+
+```bash
+./deployctl copy -c config.yaml --src ./local-package --remote-dir /opt --copy-method auto
+```
+
 复制单个文件：
 
 ```bash
@@ -348,6 +399,7 @@ export SSHPASS='your-password'
 
 ```yaml
 deploy:
+  copy_method: auto
   src_dir: "./local-package"
   remote_dir: "/opt"
   command: ""
@@ -396,6 +448,7 @@ deploy:
 
 ```yaml
 deploy:
+  copy_method: auto
   src_dir: "./local-package"
   remote_dir: "/opt"
   command: "cd /opt/local-package && chmod +x install.sh && ./install.sh"
@@ -415,6 +468,7 @@ deploy:
   -c config.yaml \
   --src ./local-package \
   --remote-dir /opt \
+  --copy-method auto \
   --cmd "cd /opt/local-package && chmod +x install.sh && ./install.sh" \
   --mode visible
 ```
@@ -432,8 +486,8 @@ vim config.yaml
 export SSHPASS='your-password'
 ./deployctl trust-add -c config.yaml -v
 
-# 4. 批量复制或部署
-./deployctl deploy -c config.yaml --mode visible --log-file ./logs/deploy.log
+# 4. 批量复制或部署，优先尝试 rsync，不满足条件自动回退 SFTP
+./deployctl deploy -c config.yaml --copy-method auto --mode visible --log-file ./logs/deploy.log
 
 # 5. 需要时取消由 deployctl 配置的免密
 ./deployctl trust-remove -c config.yaml
@@ -441,7 +495,9 @@ export SSHPASS='your-password'
 
 ## 注意事项
 
-- 文件复制使用 SFTP 递归上传，不是 rsync 差异同步协议。
+- `sftp` 是默认复制方式，不依赖 rsync。
+- `rsync` 模式依赖本机和远端都安装 rsync，并且需要可用的 SSH 私钥或 SSH agent。
+- 密码认证场景建议使用 `sftp` 或 `auto`；`auto` 会在 rsync 不可用时回退 SFTP。
 - 默认跳过严格的 known_hosts 校验，适合内网初始化和批量运维场景。
 - 生产环境如需更高安全性，建议后续增加 known_hosts 校验。
 - `visible` 模式适合观察过程；`hidden` 模式适合批量并发。
