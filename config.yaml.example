@@ -2,9 +2,14 @@
 concurrency: 5
 timeout: 30s
 
+logging:
+  file: "deployctl.log"
+  level: "info" # info, debug, trace
+
 defaults:
   user: root
   port: 22
+  # password: "your-password"
   password_env: "SSHPASS"
   key: "~/.ssh/deployctl_id_rsa"
 
@@ -12,23 +17,24 @@ trust:
   managed_key: "~/.ssh/deployctl_id_rsa"
 
 deploy:
-  src_dir: "AnyBackupClient"
+  src_dir: "local-package"
   remote_dir: "/opt"
-  command: "cd /opt/AnyBackupClient && chmod +x install-silent.sh && ./install-silent.sh"
+  command: "cd /opt/local-package && chmod +x install.sh && ./install.sh"
+  mode: hidden # hidden or visible
 
 hosts:
-  - host: 10.71.43.6
-  - host: 10.71.43.7
-  - host: 10.71.43.8
+  - host: 192.168.1.10
+  - host: 192.168.1.11
+  - host: 192.168.1.12
 
 # Different host examples:
-#  - host: 10.71.43.9
+#  - host: 192.168.1.13
 #    port: 2222
 #    password: "different-password"
 #
-#  - host: 10.71.43.10
+#  - host: 192.168.1.14
 #    user: admin
-#    password_env: "HOST_10_PASS"
+#    password_env: "HOST_14_PASS"
 #
-#  - host: 10.71.43.11
+#  - host: 192.168.1.15
 #    key: "~/.ssh/custom_id_rsa"
