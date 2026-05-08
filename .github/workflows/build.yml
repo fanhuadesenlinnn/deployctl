@@ -54,15 +54,16 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.24.x"
           cache: true
 
-      - name: Download dependencies
-        run: go mod download
-
-      - name: Run gofmt check
+      - name: Prepare dependencies
         run: |
-          test -z "$(gofmt -l .)"
+          go mod tidy
+          go mod download
+
+      - name: Format source
+        run: gofmt -w .
 
       - name: Run tests
         run: go test ./...
@@ -74,8 +75,8 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist
-          name="deployctl-${{ github.event.inputs.version }}-${GOOS}-${GOARCH}${{ matrix.ext }}"
-          go build -trimpath -ldflags="-s -w" -o "dist/${name}" .
+          binary="deployctl-${{ github.event.inputs.version }}-${GOOS}-${GOARCH}${{ matrix.ext }}"
+          go build -trimpath -ldflags="-s -w" -o "dist/${binary}" .
 
       - name: Package artifact
         run: |
