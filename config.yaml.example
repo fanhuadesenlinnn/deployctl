@@ -1,0 +1,34 @@
+# deployctl example config
+concurrency: 5
+timeout: 30s
+
+defaults:
+  user: root
+  port: 22
+  password_env: "SSHPASS"
+  key: "~/.ssh/deployctl_id_rsa"
+
+trust:
+  managed_key: "~/.ssh/deployctl_id_rsa"
+
+deploy:
+  src_dir: "AnyBackupClient"
+  remote_dir: "/opt"
+  command: "cd /opt/AnyBackupClient && chmod +x install-silent.sh && ./install-silent.sh"
+
+hosts:
+  - host: 10.71.43.6
+  - host: 10.71.43.7
+  - host: 10.71.43.8
+
+# Different host examples:
+#  - host: 10.71.43.9
+#    port: 2222
+#    password: "different-password"
+#
+#  - host: 10.71.43.10
+#    user: admin
+#    password_env: "HOST_10_PASS"
+#
+#  - host: 10.71.43.11
+#    key: "~/.ssh/custom_id_rsa"
